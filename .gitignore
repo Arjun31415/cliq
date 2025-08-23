@@ -42,4 +42,6 @@
 .direnv/
 server/build/
 server/.cache/
+client/.cache/
+client/build/
 server/compile_commands.json

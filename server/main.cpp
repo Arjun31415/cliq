@@ -48,6 +48,32 @@ int make_socket_nonblocking(int fd) {
   }
   return 0;
 }
+// ---- IO helpers ----
+bool send_all(int fd, const void *data, size_t len) {
+  const char *buf = static_cast<const char *>(data);
+  size_t total_sent = 0;
+  while (total_sent < len) {
+    ssize_t sent = send(fd, buf + total_sent, len - total_sent, 0);
+    if (sent < 0) {
+      if (errno == EINTR)
+        continue; // retry
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        return false; // try later
+      LOG_ERROR(g_logger, "send() failed: {} (errno={})", strerror(errno),
+                errno);
+      return false;
+    }
+    total_sent += sent;
+  }
+  return true;
+}
+
+bool send_message(int fd, const std::string &msg) {
+  if (!send_all(fd, msg.data(), msg.size()))
+    return false;
+  return true;
+}
+
 int main(int argc, char **argv) {
   std::signal(SIGINT, signal_handler);
   std::signal(SIGTERM, signal_handler);
@@ -208,25 +234,38 @@ int main(int argc, char **argv) {
         }
       } else {
         // Handle client data (ET → must read until EAGAIN)
+        char buffer[512]; // A temporary buffer to read chunks of data
         while (true) {
-          char buf[512];
-          ssize_t count = recv(fd, buf, sizeof(buf), 0);
-          if (count > 0) {
-            // Echo back
-            send(fd, buf, count, 0);
-          } else if (count == 0) {
-            // Client disconnected
-            LOG_INFO(g_logger, "Client (fd = {}) disconnected\n", fd);
+          ssize_t bytes_read = recv(fd, buffer, sizeof(buffer), 0);
+          if (bytes_read < 0) {
+            // Check if it was a real error or just no more data
+            // EAGAIN and EWOULDBLOCK means the kernel is telling us there is no
+            // more data to read from the socket and wait for kernel to notify
+            // again via epoll
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+              // We have read all the data for this epoll event.
+              break; // Exit the inner while loop
+            } else {
+              // A real error occurred.
+              LOG_ERROR(g_logger, "recv failed for fd {}: {}", fd,
+                        strerror(errno));
+              close(fd);
+              break;
+            }
+          } else if (bytes_read == 0) {
+            // Client closed the connection gracefully.
+            LOG_INFO(g_logger, "Client (fd = {}) disconnected", fd);
             close(fd);
             break;
           } else {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-              // No more data now
-              break;
-            } else {
-              perror("recv");
-              LOG_ERROR(g_logger, "Failed during data recieve: {} (errno={})",
-                        strerror(errno), errno);
+            // Successfully read some data. Create a string from the buffer.
+            std::string received_chunk(buffer, bytes_read);
+            LOG_INFO(g_logger, "Got chunk from client (fd={}): {}", fd,
+                     received_chunk);
+
+            // Echo the chunk back to the client.
+            if (!send_message(fd, received_chunk)) {
+              LOG_ERROR(g_logger, "Failed to send to client (fd={})", fd);
               close(fd);
               break;
             }
