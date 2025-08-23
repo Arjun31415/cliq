@@ -40,3 +40,6 @@
 # debug information files
 *.dwo
 .direnv/
+server/build/
+server/.cache/
+server/compile_commands.json
