@@ -28,6 +28,9 @@
         packages = with pkgsFor.${system}; [
           bear
           ninja
+          cmake
+          quill-log
+          cli11
         ];
       };
     });
