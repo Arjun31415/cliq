@@ -20,8 +20,9 @@
 struct Config {
   std::string host{"127.0.0.1"};
   int port{5003};
-  int buffer_size{1024};
-};
+  static const int buffer_size{512};
+  static const int max_events{64};
+} cfg;
 quill::Logger *g_logger = nullptr; // global logger
 std::atomic<bool> g_terminate{false};
 
@@ -74,11 +75,10 @@ bool send_message(int fd, const std::string &msg) {
   return true;
 }
 
-int main(int argc, char **argv) {
+int setup(int argc, char **argv) {
   std::signal(SIGINT, signal_handler);
   std::signal(SIGTERM, signal_handler);
   CLI::App app("Chat webserver in c++");
-  Config cfg;
   app.add_option("-p,--port", cfg.port,
                  "Port to listen to for incoming requests")
       ->check(CLI::Range(1024, 65535));
@@ -100,7 +100,105 @@ int main(int argc, char **argv) {
   g_logger->set_log_level(quill::LogLevel::Info); // Debug build
 #endif
   CLI11_PARSE(app, argc, argv);
-  // std::cout << "Starting server on " << cfg.host << ":" << cfg.port << "\n";
+
+  return 0;
+}
+void handle_new_connection(const int &server_fd, const int &epfd) {
+
+  // Accept all incoming connections (Edge Triggered(ET) means must loop)
+  while (true) {
+    struct sockaddr_in client_addr{};
+    socklen_t client_len = sizeof(client_addr);
+    int client_fd =
+        accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+    if (client_fd == -1) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        // No more clients to accept
+        break;
+      } else {
+        LOG_ERROR(g_logger, "Error during accept connection: {} (errno={})",
+                  strerror(errno), errno);
+        break;
+      }
+    }
+
+    make_socket_nonblocking(client_fd);
+
+    struct epoll_event client_ev{};
+    client_ev.events = EPOLLIN | EPOLLET; // edge-triggered read
+    client_ev.data.fd = client_fd;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &client_ev) == -1) {
+      LOG_ERROR(g_logger, "Error during epoll_ctl: client_fd : {} (errno={})",
+                strerror(errno), errno);
+      close(client_fd);
+      continue;
+    }
+
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+    LOG_INFO(g_logger, "Accepted connection from {}:{} (fd={})", client_ip,
+             ntohs(client_addr.sin_port), server_fd);
+  }
+}
+void handle_client_data(const int &fd) {
+  // Handle client data (ET → must read until EAGAIN)
+  char buffer[cfg.buffer_size]; // A temporary buffer to read chunks of data
+  while (true) {
+    ssize_t bytes_read = recv(fd, buffer, sizeof(buffer), 0);
+    if (bytes_read < 0) {
+      // Check if it was a real error or just no more data
+      // EAGAIN and EWOULDBLOCK means the kernel is telling us there is no
+      // more data to read from the socket and wait for kernel to notify
+      // again via epoll
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        // We have read all the data for this epoll event.
+        break; // Exit the inner while loop
+      } else {
+        // A real error occurred.
+        LOG_ERROR(g_logger, "recv failed for fd {}: {}", fd, strerror(errno));
+        close(fd);
+        break;
+      }
+    } else if (bytes_read == 0) {
+      // Client closed the connection gracefully.
+      LOG_INFO(g_logger, "Client (fd = {}) disconnected", fd);
+      close(fd);
+      break;
+    } else {
+      // Successfully read some data. Create a string from the buffer.
+      std::string received_chunk(buffer, bytes_read);
+      LOG_INFO(g_logger, "Got chunk from client (fd={}): {}", fd,
+               received_chunk);
+
+      // Echo the chunk back to the client.
+      if (!send_message(fd, received_chunk)) {
+        LOG_ERROR(g_logger, "Failed to send to client (fd={})", fd);
+        close(fd);
+        break;
+      }
+    }
+  }
+}
+
+void handle_events(const int &n, epoll_event *events, const int &server_fd,
+                   const int &epfd) {
+
+  for (int i = 0; i < n; i++) {
+    int fd = events[i].data.fd;
+    LOG_DEBUG(g_logger, "event fd:{} server fd:{}", fd, server_fd);
+    if (fd == server_fd) {
+      // new connection
+      handle_new_connection(server_fd, epfd);
+    } else {
+      handle_client_data(fd);
+    }
+  }
+}
+
+int main(int argc, char **argv) {
+  if (setup(argc, argv)) {
+    LOG_ERROR(g_logger, "Error during setup");
+  }
 
   // ----------------- CREATE TCP SERVER ------------------------------
   //
@@ -166,8 +264,7 @@ int main(int argc, char **argv) {
               strerror(errno), errno);
     return 1;
   }
-  const int max_events = 64;
-  epoll_event ev{}, events[max_events];
+  epoll_event ev{}, events[cfg.max_events];
   ev.events = EPOLLIN | EPOLLET; // ready for read (edge triggered)
   ev.data.fd = server_fd;
   if (epoll_ctl(epfd, EPOLL_CTL_ADD, server_fd, &ev) == -1) {
@@ -180,7 +277,7 @@ int main(int argc, char **argv) {
 
   // 3. EVENT LOOP:
   while (!g_terminate.load()) {
-    int n = epoll_wait(epfd, events, max_events, -1);
+    int n = epoll_wait(epfd, events, cfg.max_events, -1);
     LOG_DEBUG(g_logger, "num events: {}", n);
     if (n == -1) {
       if (errno == EINTR)
@@ -189,90 +286,7 @@ int main(int argc, char **argv) {
                 strerror(errno), errno);
       break; // need to cleanup
     }
-
-    for (int i = 0; i < n; i++) {
-      int fd = events[i].data.fd;
-      LOG_DEBUG(g_logger, "event fd:{} server fd:{}", fd, server_fd);
-      if (fd == server_fd) {
-        // new connection
-        // Accept all incoming connections (ET means must loop)
-        while (true) {
-          struct sockaddr_in client_addr{};
-          socklen_t client_len = sizeof(client_addr);
-          int client_fd =
-              accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-          if (client_fd == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-              // No more clients to accept
-              break;
-            } else {
-              LOG_ERROR(g_logger,
-                        "Error during accept connection: {} (errno={})",
-                        strerror(errno), errno);
-              break;
-            }
-          }
-
-          make_socket_nonblocking(client_fd);
-
-          struct epoll_event client_ev{};
-          client_ev.events = EPOLLIN | EPOLLET; // edge-triggered read
-          client_ev.data.fd = client_fd;
-          if (epoll_ctl(epfd, EPOLL_CTL_ADD, client_fd, &client_ev) == -1) {
-            LOG_ERROR(g_logger,
-                      "Error during epoll_ctl: client_fd : {} (errno={})",
-                      strerror(errno), errno);
-            close(client_fd);
-            continue;
-          }
-
-          char client_ip[INET_ADDRSTRLEN];
-          inet_ntop(AF_INET, &client_addr.sin_addr, client_ip,
-                    sizeof(client_ip));
-          LOG_INFO(g_logger, "Accepted connection from {}:{} (fd={})",
-                   client_ip, ntohs(client_addr.sin_port), fd);
-        }
-      } else {
-        // Handle client data (ET → must read until EAGAIN)
-        char buffer[512]; // A temporary buffer to read chunks of data
-        while (true) {
-          ssize_t bytes_read = recv(fd, buffer, sizeof(buffer), 0);
-          if (bytes_read < 0) {
-            // Check if it was a real error or just no more data
-            // EAGAIN and EWOULDBLOCK means the kernel is telling us there is no
-            // more data to read from the socket and wait for kernel to notify
-            // again via epoll
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-              // We have read all the data for this epoll event.
-              break; // Exit the inner while loop
-            } else {
-              // A real error occurred.
-              LOG_ERROR(g_logger, "recv failed for fd {}: {}", fd,
-                        strerror(errno));
-              close(fd);
-              break;
-            }
-          } else if (bytes_read == 0) {
-            // Client closed the connection gracefully.
-            LOG_INFO(g_logger, "Client (fd = {}) disconnected", fd);
-            close(fd);
-            break;
-          } else {
-            // Successfully read some data. Create a string from the buffer.
-            std::string received_chunk(buffer, bytes_read);
-            LOG_INFO(g_logger, "Got chunk from client (fd={}): {}", fd,
-                     received_chunk);
-
-            // Echo the chunk back to the client.
-            if (!send_message(fd, received_chunk)) {
-              LOG_ERROR(g_logger, "Failed to send to client (fd={})", fd);
-              close(fd);
-              break;
-            }
-          }
-        }
-      }
-    }
+    handle_events(n, events, server_fd, epfd);
   }
 
   LOG_DEBUG(g_logger, "Shutting down server gracefully");
