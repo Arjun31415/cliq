@@ -1,9 +1,8 @@
+#include "protocol.hpp"
 #include <CLI/CLI.hpp>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
-#include <iostream>
-#include <memory>
 #include <netinet/in.h>
 #include <quill/Backend.h>
 #include <quill/Frontend.h>
@@ -11,7 +10,6 @@
 #include <quill/Logger.h>
 #include <quill/sinks/ConsoleSink.h>
 #include <string>
-#include <string_view>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -25,6 +23,16 @@ struct Config {
 } cfg;
 quill::Logger *g_logger = nullptr; // global logger
 std::atomic<bool> g_terminate{false};
+
+struct ClientInfo {
+  int fd;
+  std::string username;
+  int connected_fd{-1}; // -1 if not connected. fd of the other user it is
+                        // connected to, to chat with.
+  std::vector<char> buffer;
+};
+std::unordered_map<int, ClientInfo> clients;       // fd : info
+std::unordered_map<std::string, int> username_map; // username : fd
 
 // Signal handler
 void signal_handler(int signo) {
@@ -75,6 +83,16 @@ bool send_message(int fd, const std::string &msg) {
   return true;
 }
 
+bool send_message(int fd, const std::vector<char> &msg) {
+  if (!send_all(fd, msg.data(), msg.size()))
+    return false;
+  return true;
+}
+bool send_message(int fd, const Message &msg) {
+  auto raw_msg = msg.serialize();
+  return send_message(fd, raw_msg);
+}
+
 int setup(int argc, char **argv) {
   std::signal(SIGINT, signal_handler);
   std::signal(SIGTERM, signal_handler);
@@ -102,6 +120,123 @@ int setup(int argc, char **argv) {
   CLI11_PARSE(app, argc, argv);
 
   return 0;
+}
+void process_message(ClientInfo &client, const Message &msg) {
+  auto convert_to_vec = [](const std::string &&str) {
+    return std::vector<std::uint8_t>(str.begin(), str.end());
+  };
+  switch (msg.header.type) {
+  case MessageType::LoginReq: {
+    std::string username(msg.payload.begin(), msg.payload.end());
+    if (username.empty() || username_map.count(username)) {
+      Message reply(MessageType::LoginFail, {});
+      send_message(client.fd, reply);
+    } else {
+      client.username = username;
+      username_map[username] = client.fd;
+      Message reply(MessageType::ConnectionToClientSuccess, {});
+      send_message(client.fd, reply);
+    }
+    break;
+  }
+
+  case MessageType::ConnectionToClientReq: {
+    std::string target(msg.payload.begin(), msg.payload.end());
+    auto it = username_map.find(target);
+    if (it == username_map.end()) {
+      Message reply(MessageType::ConnectionToClientFail,
+                    convert_to_vec("Username not found"));
+      send_message(client.fd, reply);
+    } else {
+      int target_fd = it->second;
+      // client.connected_fd = target_fd;
+      // Message reply(MessageType::ConnectionToClientSuccess, {});
+      // send_message(client.fd, reply);
+
+      // Notify target user of incoming connection
+      Message notify(
+          MessageType::IncomingConnectionReq,
+          std::vector<uint8_t>(client.username.begin(), client.username.end()));
+      send_message(target_fd, notify);
+    }
+    break;
+  }
+  case MessageType::AcceptIncomingConnectionReq: {
+
+    std::string target(msg.payload.begin(), msg.payload.end());
+    auto it = username_map.find(target);
+    if (it == username_map.end()) {
+      // client disconnected
+      Message reply(
+          MessageType::ConnectionToClientFail,
+          convert_to_vec("target client: " + target + " disconnected"));
+      send_message(client.fd, reply);
+    } else {
+      int target_fd = it->second;
+      client.connected_fd = target_fd;
+      clients[target_fd].connected_fd = client.fd;
+
+      Message reply(MessageType::ConnectionToClientSuccess, {});
+      send_message(target_fd, reply);
+      send_message(client.fd, reply);
+    }
+    break;
+  }
+
+  case MessageType::RejectIncomingConnectionReq: {
+
+    std::string target(msg.payload.begin(), msg.payload.end());
+    auto it = username_map.find(target);
+    if (it == username_map.end()) {
+      // target client disconnected
+      // do nothing as sender client does not expect a reply
+    } else {
+      int target_fd = it->second;
+
+      Message reply(MessageType::ConnectionToClientFail,
+                    convert_to_vec(clients[client.fd].username +
+                                   " does not want to connect."));
+      send_message(target_fd, reply);
+    }
+    break;
+  }
+
+  case MessageType::ChatMessage: {
+    if (client.connected_fd == -1) {
+      LOG_ERROR(g_logger, "Client {} tried to send chat without connection",
+                client.username);
+      break;
+    }
+    auto &payload = msg.payload;
+    LOG_DEBUG(
+        g_logger, "Message: {}",
+        static_cast<std::ostringstream &&>(std::ostringstream() << msg).str());
+    send_message(client.connected_fd, msg); // forward to connected client
+    break;
+  }
+
+  default:
+    LOG_ERROR(
+        g_logger, "Unknown message type from {}: {}", client.username,
+        static_cast<std::ostringstream &&>(std::ostringstream() << msg).str());
+  }
+}
+void remove_client(int fd) {
+  auto it = clients.find(fd);
+  if (it != clients.end()) {
+    LOG_DEBUG(g_logger, "Client disconnected: {}", it->second.username);
+    if (!it->second.username.empty()) {
+      int other = it->second.connected_fd;
+      if (other != -1) {
+        Message reply(MessageType::ClientDisconnected, {});
+        send_message(other, reply);
+        clients.at(other).connected_fd = -1;
+      }
+      username_map.erase(it->second.username);
+    }
+    clients.erase(it);
+  }
+  close(fd);
 }
 void handle_new_connection(const int &server_fd, const int &epfd) {
 
@@ -142,41 +277,48 @@ void handle_new_connection(const int &server_fd, const int &epfd) {
 }
 void handle_client_data(const int &fd) {
   // Handle client data (ET → must read until EAGAIN)
-  char buffer[cfg.buffer_size]; // A temporary buffer to read chunks of data
+  auto it = clients.find(fd);
+  if (it == clients.end()) {
+    // First time seeing this client
+    clients[fd] = ClientInfo{fd};
+    it = clients.find(fd);
+  }
+  ClientInfo &client = it->second;
+
+  char buffer[cfg.buffer_size];
+
   while (true) {
     ssize_t bytes_read = recv(fd, buffer, sizeof(buffer), 0);
     if (bytes_read < 0) {
-      // Check if it was a real error or just no more data
-      // EAGAIN and EWOULDBLOCK means the kernel is telling us there is no
-      // more data to read from the socket and wait for kernel to notify
-      // again via epoll
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        // We have read all the data for this epoll event.
-        break; // Exit the inner while loop
+        break; // no more data for ET
       } else {
-        // A real error occurred.
         LOG_ERROR(g_logger, "recv failed for fd {}: {}", fd, strerror(errno));
-        close(fd);
+        remove_client(fd);
         break;
       }
     } else if (bytes_read == 0) {
-      // Client closed the connection gracefully.
       LOG_INFO(g_logger, "Client (fd = {}) disconnected", fd);
-      close(fd);
+      remove_client(fd);
       break;
-    } else {
-      // Successfully read some data. Create a string from the buffer.
-      std::string received_chunk(buffer, bytes_read);
-      LOG_INFO(g_logger, "Got chunk from client (fd={}): {}", fd,
-               received_chunk);
-
-      // Echo the chunk back to the client.
-      if (!send_message(fd, received_chunk)) {
-        LOG_ERROR(g_logger, "Failed to send to client (fd={})", fd);
-        close(fd);
-        break;
-      }
     }
+
+    // Append new data to client's leftover buffer
+    client.buffer.insert(client.buffer.end(), buffer, buffer + bytes_read);
+
+    // Deserialize full message
+    Message msg =
+        Message::deserialize(client.buffer.data(), client.buffer.size());
+    LOG_DEBUG(
+        g_logger, "Deserialized message from fd {}: {}", fd,
+        static_cast<std::ostringstream &&>(std::ostringstream() << msg).str());
+
+    // Handle message
+    process_message(client, msg);
+
+    // Remove processed bytes
+    client.buffer.erase(client.buffer.begin(),
+                        client.buffer.begin() + client.buffer.size());
   }
 }
 
@@ -204,8 +346,8 @@ int main(int argc, char **argv) {
   //
   // 1. create server socket
   // socket() returns fd (>=0) on success which is the file descrptor of the
-  // listening socket. internally kernel keeps a socket object, we just hold the
-  // file descriptor
+  // listening socket. internally kernel keeps a socket object, we just hold
+  // the file descriptor
   int server_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (server_fd < 0) {
     LOG_ERROR(g_logger, "Failed to create socket: {} (errno={})",
@@ -217,16 +359,16 @@ int main(int argc, char **argv) {
   // SOL_SOCKET is a socket option level
   //
   // SO_REUSEADDR is the option which controls whether you can reuse a local
-  // address/port that is in a TIME_WAIT state. Normally, if you close a server
-  // and restart it immediately, bind() might fail with bind: Address already in
-  // use because the port is stuck in TIME_WAIT.
-  // SO_REUSEADDR does not allow two processes to bind to the exact same port at
-  // the same time (unless combined with SO_REUSEPORT)
+  // address/port that is in a TIME_WAIT state. Normally, if you close a
+  // server and restart it immediately, bind() might fail with bind: Address
+  // already in use because the port is stuck in TIME_WAIT. SO_REUSEADDR does
+  // not allow two processes to bind to the exact same port at the same time
+  // (unless combined with SO_REUSEPORT)
   //
-  // SO_REUSEPORT - Allows multiple sockets (possibly in different processes or
-  // threads) to bind to the same IP+port. The kernel will load-balance incoming
-  // connections across them. Useful for multi-threaded servers (e.g. nginx
-  // workers).
+  // SO_REUSEPORT - Allows multiple sockets (possibly in different processes
+  // or threads) to bind to the same IP+port. The kernel will load-balance
+  // incoming connections across them. Useful for multi-threaded servers (e.g.
+  // nginx workers).
   //
   // SO_KEEPALIVE - Enables TCP keepalive packets to detect dead peers.
   //
