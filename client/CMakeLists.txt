@@ -18,6 +18,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # First try system-installed Quill
 find_package(Quill QUIET)
 find_package(CLI11 CONFIG)
+find_package(magic_enum REQUIRED)
 
 if (NOT Quill_FOUND)
     message(STATUS "Quill not found on system, fetching with FetchContent...")
@@ -40,12 +41,26 @@ if (NOT CLI11_FOUND)
 )
     FetchContent_MakeAvailable(cli11_proj)
 endif()
+
+if (NOT MAGIC_ENUM_FOUND)
+
+    include(FetchContent)
+    FetchContent_Declare(
+        magic_enum
+        GIT_REPOSITORY https://github.com/Neargye/magic_enum.git
+        GIT_TAG v0.9.7
+)
+    FetchContent_MakeAvailable(magic_enum)
+endif()
 # ---- App ----
 add_executable(${APP_NAME} main.cpp)
 target_link_libraries(${APP_NAME} PRIVATE CLI11::CLI11)
 target_link_libraries(${APP_NAME} PRIVATE quill::quill)
+target_link_libraries(${APP_NAME} PRIVATE magic_enum::magic_enum)
 target_include_directories(${APP_NAME} PRIVATE ${CMAKE_SOURCE_DIR})
-
+target_include_directories(${APP_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
 # Enable warnings
 target_compile_options(${APP_NAME} PRIVATE -Wall -Wextra -Wpedantic)
 
