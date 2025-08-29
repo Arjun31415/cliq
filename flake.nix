@@ -31,6 +31,7 @@
           cmake
           quill-log
           cli11
+          magic-enum
         ];
       };
     });
