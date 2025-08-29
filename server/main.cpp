@@ -149,10 +149,6 @@ void process_message(ClientInfo &client, const Message &msg) {
       send_message(client.fd, reply);
     } else {
       int target_fd = it->second;
-      // client.connected_fd = target_fd;
-      // Message reply(MessageType::ConnectionToClientSuccess, {});
-      // send_message(client.fd, reply);
-
       // Notify target user of incoming connection
       Message notify(
           MessageType::IncomingConnectionReq,
@@ -207,7 +203,6 @@ void process_message(ClientInfo &client, const Message &msg) {
                 client.username);
       break;
     }
-    auto &payload = msg.payload;
     LOG_DEBUG(
         g_logger, "Message: {}",
         static_cast<std::ostringstream &&>(std::ostringstream() << msg).str());

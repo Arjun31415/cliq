@@ -56,29 +56,6 @@ bool send_all(int fd, const void *data, size_t len) {
   return true;
 }
 
-// bool send_message(int fd, const std::string &msg) {
-//   return send_all(fd, msg.data(), msg.size());
-// }
-//
-// bool recv_message(int fd, std::string &msg) {
-//   char buffer[512]; // A temporary buffer
-//   ssize_t bytes_read = recv(fd, buffer, sizeof(buffer), 0);
-//
-//   if (bytes_read < 0) {
-//     LOG_ERROR(g_logger, "recv() failed: {}", strerror(errno));
-//     return false;
-//   }
-//   if (bytes_read == 0) {
-//     // This means the server closed the connection.
-//     return false;
-//   }
-//
-//   // Assign the exact number of bytes read.
-//   msg.assign(buffer, bytes_read);
-//   return true;
-// }
-//
-
 bool send_message(int fd, const Message &msg) {
   auto raw = msg.serialize();
   return send_all(fd, raw.data(), raw.size());
